@@ -3,3 +3,6 @@ __pycache__/
 .venv/
 .pytest_cache/
 .git/
+*.db
+*.db-wal
+*.db-shm

@@ -1,9 +1,14 @@
-# Modbus TCP 电表试采接口
+# Modbus TCP 电表试采与主备归并接口
 
 新电表接入能耗库前的单台 Modbus TCP 电表试采服务：厂务工程师提交测点的
 保持寄存器起始地址（从 0 算）与字数（1 或 2），并给出设备的可读区间
 （含两端）与单次读取上限；接口自动规划读段、按方案读表，返回读段与
 无符号计数（双字按高字在前拼接）。
+
+同一台电表由主、备两路网关同时轮询时，另提供归并接口：每批注明表号与
+主备角色，提交约定的 UTC 轮询秒和两个 16 位无符号寄存器字；按表号查询
+时只列两路都已报齐的时点，同值合并、单路注明来源、异值并列待核对，
+给能耗库一份不重复的读数。
 
 ## 快速开始（Docker Compose）
 
@@ -13,6 +18,7 @@ docker compose up --build
 
 - API：<http://localhost:8000>，Swagger UI：<http://localhost:8000/docs>
 - 模拟电表：`localhost:1502`（容器内 `meter:502`），保持寄存器 0..99
+- 归并数据：SQLite 文件位于容器内 `/data/merge.db`（Compose 命名卷持久化）
 
 在 Swagger 中打开 `POST /read` → Try it out → 直接 Execute 即可对模拟表试采
 （请求体默认指向容器内的模拟表）。也可在宿主机用 curl：
@@ -31,6 +37,36 @@ curl -X POST http://localhost:8000/read \
     "range_end": 99,
     "max_read": 8
   }'
+```
+
+### Swagger 演示：备路迟报后查到待核对记录
+
+1. `POST /merge/batches` 选择 **primary_batch** 样例执行：主路在 UTC 秒
+   `1760000000` 报 `0x0001/0x86A0`（高字在前 = `100000`）并声明已报齐；
+2. 再选择 **backup_late_conflict** 样例执行：备路稍后在同一秒报异值
+   `0x0001/0x86A1`（= `100001`）并声明已报齐；
+3. 打开 `GET /merge/meters/M-1001` → Execute，得到：
+
+```json
+{
+  "meter_id": "M-1001",
+  "items": [{
+    "second": 1760000000,
+    "status": "conflict",
+    "value": null,
+    "source": null,
+    "primary_value": 100000,
+    "backup_value": 100001,
+    "ingest_count": 0,
+    "needs_review": true
+  }],
+  "total": 1,
+  "ingest_count": 0,
+  "conflict_count": 1,
+  "pending_review_count": 1,
+  "merged_count": 0,
+  "single_source_count": 0
+}
 ```
 
 ## 接口说明
@@ -66,6 +102,67 @@ curl -X POST http://localhost:8000/read \
   `detail` 为中文原因；
 - `502`：连接失败或 Modbus 读取失败（含设备异常响应），**不返回部分读数**。
 
+### 归并：约定
+
+- **表号与角色**：每批只属于一个 `meter_id` 和一个 `role`
+  （`primary` 主 / `backup` 备；也接受 `main` / `standby` 等别名）。
+- **读数**：`second` 为约定的 UTC 轮询秒（Unix 秒），`words` 为两个
+  16 位无符号寄存器字，沿用 `/read` 的**高字在前**解码为无符号计数。
+- **进度**：`progress` / `through_second` 表示本路已报齐到该秒（**含该秒**）。
+  进度只进不退；可随批声明，也可调用单独的进度接口。
+- **幂等与拒收**：同一路同秒同值重报跳过；同一路同秒异值、
+  或补报本路先前已报齐范围内的新读数，**整批拒收**（`409`），
+  不写入该批任何读数，也不推进进度。较低的进度声明不会推进进度，
+  也不会使进度回退。
+- **原子性**：读数与进度在同一个 SQLite 事务（`BEGIN IMMEDIATE`）中提交。
+
+### `POST /merge/batches`
+
+提交一批本路读数，可同时声明进度。路径别名（不出现在 Swagger）：
+`POST /merge`、`/merge/batch`、`/merge/readings` 等。
+
+```json
+{
+  "meter_id": "M-1001",
+  "role": "primary",
+  "readings": [{"second": 1760000000, "words": [1, 34464]}],
+  "progress": 1760000000
+}
+```
+
+响应：
+
+| 字段 | 说明 |
+| --- | --- |
+| `received` / `inserted` | 本批收到 / 新写入的读数条数 |
+| `skipped_duplicates` | 同秒同值重报、被跳过的条数 |
+| `progress_through` / `progress_updated` | 提交后本路进度，以及本次是否推进 |
+
+### `POST /merge/progress`
+
+单独声明某表号、某角色的本路进度（`through_second`，含该秒）。
+也接受 `PUT /merge/progress`；进度相同为幂等，较低的值被忽略并保持原进度。
+
+```json
+{"meter_id": "M-1001", "role": "backup", "through_second": 1760000000}
+```
+
+### `GET /merge/meters/{meter_id}`
+
+按表号查询。只列**两路均已报齐到该秒（含）且至少一路有读数**的时点；
+整条查询在单条 SQL 中读取同一份已提交快照，并发补报不会改变已经可查的
+时点。结果按 UTC 秒升序：
+
+| `status` | 条件 | 输出 |
+| --- | --- | --- |
+| `merged` | 两路都有值且相同 | 一条 `value`，`ingest_count = 1` |
+| `single_source` | 只有一路有值 | 采用该值，`source` 注明 `primary` / `backup`，`ingest_count = 1` |
+| `conflict` | 两路都有值但不同 | 并列 `primary_value` / `backup_value`，`value` 为空，`ingest_count = 0`，`needs_review = true` |
+
+顶层同时给出 `total`、`ingest_count`（可入库合计）、`conflict_count` /
+`pending_review_count`、`merged_count`、`single_source_count`；
+`readings` 为与 `items` 内容相同的同义列表。
+
 ## 模拟电表数据
 
 `simulator/meter_sim.py`：保持寄存器 0..99，可读区间 `[0, 99]`。
@@ -83,18 +180,27 @@ curl -X POST http://localhost:8000/read \
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 METER_PORT=1502 .venv/bin/python -m simulator.meter_sim &
 METER_HOST=127.0.0.1 METER_PORT=1502 .venv/bin/uvicorn app.main:app --port 8000
-.venv/bin/pytest            # 13 个用例：规划算法 + API 集成
+.venv/bin/pytest            # 22 个用例：规划算法 + 试采集成 + 归并语义
 ```
 
-环境变量：`METER_HOST` / `METER_PORT` / `METER_SLAVE_ID` / `METER_TIMEOUT`
-为 API 请求体连接参数的默认值（Compose 中已注入）。
+环境变量：
+
+- `METER_HOST` / `METER_PORT` / `METER_SLAVE_ID` / `METER_TIMEOUT`
+  为 `/read` 请求体连接参数的默认值（Compose 中已注入）；
+- `MERGE_DB_PATH`（或 `MERGE_DB`）为归并 SQLite 文件路径，
+  默认当前目录下 `merge.db`；Compose 中为 `/data/merge.db`。
 
 ## 目录结构
 
 ```
-app/main.py        FastAPI 接口与读表执行
-app/planner.py     读段规划（动态规划：次数最少 -> 寄存器总数最少）
-simulator/         pymodbus 内存模拟电表
-tests/             规划单元测试 + API 集成测试（内存模拟表，无需 Docker）
-docker-compose.yml api + meter 两个服务
+app/main.py           FastAPI 试采接口与读表执行
+app/planner.py        读段规划（动态规划：次数最少 -> 寄存器总数最少）
+app/merge_api.py      归并 API（批次、单独进度、按表号查询、Swagger 样例）
+app/merge_service.py  归并规则与事务内校验 / 查询
+app/db.py             SQLite 连接、建表、WAL 与事务边界
+app/codec.py          高字在前的无符号解码
+simulator/            pymodbus 内存模拟电表
+tests/                规划单元测试 + 试采 / 归并集成测试
+docker-compose.yml    api + meter 两个服务
 ```
+

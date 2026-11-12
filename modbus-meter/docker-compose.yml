@@ -22,8 +22,14 @@ services:
       METER_PORT: "502"
       METER_SLAVE_ID: "1"
       METER_TIMEOUT: "3"
+      MERGE_DB_PATH: "/data/merge.db"
+    volumes:
+      - merge-data:/data
     ports:
       - "8000:8000"
     depends_on:
       meter:
         condition: service_healthy
+
+volumes:
+  merge-data:

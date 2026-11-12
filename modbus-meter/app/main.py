@@ -1,4 +1,4 @@
-"""FastAPI：单台 Modbus TCP 电表试采接口。"""
+"""FastAPI：单台 Modbus TCP 电表试采接口 + 主备两路读数归并。"""
 
 from __future__ import annotations
 
@@ -9,6 +9,8 @@ from pydantic import BaseModel, Field, model_validator
 from pymodbus.client import AsyncModbusTcpClient
 from pymodbus.exceptions import ModbusException
 
+from .codec import decode_unsigned
+from .merge_api import router as merge_router
 from .planner import PlanError, Segment, plan_reads
 
 DEFAULT_HOST = os.getenv("METER_HOST", "meter")
@@ -62,24 +64,23 @@ class ReadResponse(BaseModel):
 
 
 app = FastAPI(
-    title="Modbus TCP 电表试采接口",
-    version="1.0.0",
+    title="Modbus TCP 电表试采与主备归并接口",
+    version="1.1.0",
     description=(
-        "提交测点保持寄存器起始地址（从 0 算）与字数（1 或 2），"
+        "**试采**：提交测点保持寄存器起始地址（从 0 算）与字数（1 或 2），"
         "并给出设备可读区间（含两端）与单次读取上限。"
         "接口先做读段规划（请求次数最少，次数相同则读取寄存器总数最少），"
         "再逐段读取，返回读段与无符号计数（双字高字在前）。"
-        "无可行方案或读取失败时直接报错，不返回部分读数。"
+        "无可行方案或读取失败时直接报错，不返回部分读数。\n\n"
+        "**主备归并**：同一电表由主、备两路网关轮询。`POST /merge/batches` "
+        "提交某一路在某个 UTC 轮的读数（两个 16 位寄存器字，高字在前）并可"
+        "同时声明本路已报齐到哪一秒；`POST /merge/progress` 可单独声明进度；"
+        "`GET /merge/meters/{meter_id}` 只返回两路均已报齐的时点，并按"
+        "同值合并、单路注明来源、异值待核对三种情况输出。"
     ),
 )
 
-
-def decode_unsigned(words: list[int]) -> int:
-    """无符号拼接；双字高字在前（big-endian / 高字在低地址）。"""
-    value = 0
-    for word in words:
-        value = (value << 16) | (word & 0xFFFF)
-    return value
+app.include_router(merge_router)
 
 
 @app.get("/", include_in_schema=False)
